@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+#  redis:
+#    image: redis:latest
+
+  airflow-webserver:
+    build: .
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+  airflow-scheduler:
+    build: .
+    command: airflow scheduler
+    depends_on:
+      - airflow-webserver
+
+volumes:
+  postgres_data:
