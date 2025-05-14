@@ -1,63 +1,80 @@
-from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-import pandas as pd
+from datetime import datetime
 import sqlite3
+import pandas as pd
+import os
+from time import time
+from typing import Tuple
 
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': datetime(2023, 1, 1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
+ROOT_TASK_DATA = "/opt/airflow/task_data"
+DB_PATH = f"{ROOT_TASK_DATA}/db/titanic.db"
+CSV_SOURCE = f"{ROOT_TASK_DATA}/raw/titanic.csv"
+PROCESSED_DIR = f"{ROOT_TASK_DATA}/processed"
 
-def load_csv_to_sqlite(csv_path, db_path, table_name):
-    df = pd.read_csv(csv_path)
-    conn = sqlite3.connect(db_path)
-    df.to_sql(table_name, conn, if_exists='replace', index=False)
-    conn.close()
-    print(f"Data from {csv_path} successfully loaded to table '{table_name}' in database {db_path}")
+RAW_TABLE = "raw_data"
+PREPROCESSED_TABLE = "preprocessed_data"
 
-def preprocess(input_table: str, output_table: str, db_path: str):
-    conn = sqlite3.connect(db_path)
-    df = pd.read_sql(f"SELECT * FROM {input_table}", conn)
+def append_csv_to_sqlite():
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
     
-    # Preprocessing steps
+    if os.path.exists(CSV_SOURCE):
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_csv(CSV_SOURCE)
+        df.to_sql(RAW_TABLE, conn, if_exists="replace", index=False)
+        conn.close()
+        
+        timestamp = int(time())
+        processed_path = os.path.join(PROCESSED_DIR, f"increment_done_{timestamp}.csv")
+        os.rename(CSV_SOURCE, processed_path)
+        return True
+    return False
+
+def preprocess_data(**kwargs) -> pd.DataFrame:
+    ti = kwargs['ti']
+    file_processed = ti.xcom_pull(task_ids='append_csv_to_sqlite')
+    
+    if not file_processed:
+        raise ValueError("No new data to process")
+    
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql(f"SELECT * FROM {RAW_TABLE}", conn)
+    conn.close()
+    
     df = df.drop(['Name', 'Ticket', 'Cabin', 'PassengerId'], axis=1, errors='ignore')
     df['Age'] = df['Age'].fillna(df['Age'].median())
     df = pd.get_dummies(df, columns=['Sex'], drop_first=True)
     
-    # Save to SQLite
-    df.to_sql(output_table, conn, if_exists='replace', index=False)
+    return df
+
+def save_preprocessed_data(**kwargs):
+    ti = kwargs['ti']
+    df_preprocessed = ti.xcom_pull(task_ids='preprocess_data')
+    
+    conn = sqlite3.connect(DB_PATH)
+    df_preprocessed.to_sql(PREPROCESSED_TABLE, conn, if_exists="append", index=False)
     conn.close()
-    print(f"Preprocessed data saved to table '{output_table}' in database {db_path}")
+    print(f"Saved {len(df_preprocessed)} preprocessed rows to {PREPROCESSED_TABLE}")
 
 with DAG(
-    'data_preprocessing_pipeline',
-    default_args=default_args,
-    description='A simple data preprocessing pipeline',
+    "split_preprocessing",
+    start_date=datetime(2023, 1, 1),
     catchup=False,
 ) as dag:
-
-    load_data = PythonOperator(
-        task_id='load_csv_to_sqlite',
-        python_callable=load_csv_to_sqlite,
-        op_kwargs={
-            'csv_path': '/opt/airflow/task_data/raw/titanic.csv',  # Update this path
-            'db_path': '/opt/airflow/task_data/db/titanic.db',  # Update this path
-            'table_name': 'raw_data'
-        }
+    
+    append_task = PythonOperator(
+        task_id="append_csv_to_sqlite",
+        python_callable=append_csv_to_sqlite,
     )
-
-    preprocess_data = PythonOperator(
-        task_id='preprocess_data',
-        python_callable=preprocess,
-        op_kwargs={
-            'input_table': 'raw_data',
-            'output_table': 'preprocessed_data',
-            'db_path': '/opt/airflow/task_data/db/titanic.db'  # Should match the db_path above
-        }
+    
+    preprocess_task = PythonOperator(
+        task_id="preprocess_data",
+        python_callable=preprocess_data,
     )
-
-    load_data >> preprocess_data
+    
+    save_task = PythonOperator(
+        task_id="save_preprocessed_data",
+        python_callable=save_preprocessed_data,
+    )
+    
+    append_task >> preprocess_task >> save_task
